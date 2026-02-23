@@ -18,6 +18,6 @@ if __name__ == "__main__":
         description=DESCRIPTION,
         url=URL,
         python_requires=">=3.11",
-        packages=find_packages(include=["app", "app.*"]),
+        packages=find_packages(include=["app", "app.*", "src", "src.*", "third_party", "third_party.*"]),
         install_requires=get_requirements(),
     )
