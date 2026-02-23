@@ -37,14 +37,14 @@ def load_pretrained(
     if load_encoder:
         # -- loading encoder
         pretrained_dict = checkpoint[context_encoder_key]
-        pretrained_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items()}
+        pretrained_dict = {k.replace("backbone.", "").replace("module.", ""): v for k, v in pretrained_dict.items()}
         msg = encoder.load_state_dict(pretrained_dict, strict=False)
         logger.info(f"loaded pretrained encoder from epoch {epoch} with msg: {msg}")
 
     if load_predictor:
         # -- loading predictor
         pretrained_dict = checkpoint["predictor"]
-        pretrained_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items()}
+        pretrained_dict = {k.replace("backbone.", "").replace("module.", ""): v for k, v in pretrained_dict.items()}
         msg = predictor.load_state_dict(pretrained_dict, strict=False)
         logger.info(f"loaded pretrained predictor from epoch {epoch} with msg: {msg}")
 
@@ -53,7 +53,7 @@ def load_pretrained(
         if target_encoder is not None:
             print(list(checkpoint.keys()))
             pretrained_dict = checkpoint[target_encoder_key]
-            pretrained_dict = {k.replace("backbone.", ""): v for k, v in pretrained_dict.items()}
+            pretrained_dict = {k.replace("backbone.", "").replace("module.", ""): v for k, v in pretrained_dict.items()}
             msg = target_encoder.load_state_dict(pretrained_dict, strict=False)
             logger.info(f"loaded pretrained target encoder from epoch {epoch} with msg: {msg}")
 

@@ -200,7 +200,8 @@ def main(args, resume_preempt=False):
         pred_depth=pred_depth,
         pred_num_heads=pred_num_heads,
         pred_embed_dim=pred_embed_dim,
-        action_embed_dim=7,
+        # Pose is a 4x4 matrix per frame -> 16D embedding.
+        action_embed_dim=16,
         pred_is_frame_causal=pred_is_frame_causal,
         use_extrinsics=use_extrinsics,
         use_sdpa=use_sdpa,
@@ -388,12 +389,10 @@ def main(args, resume_preempt=False):
 
             def load_clips():
                 clips = sample[0].to(device, non_blocking=True)  # [B C T H W]
-                actions = sample[1].to(device, dtype=torch.float, non_blocking=True)  # [B T-1 7]
-                states = sample[2].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
-                extrinsics = sample[3].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
-                return (clips, actions, states, extrinsics)
+                poses = sample[1].to(device, dtype=torch.float, non_blocking=True)  # [B T 4 4]
+                return clips, poses
 
-            clips, actions, states, extrinsics = load_clips()
+            clips, poses = load_clips()
             data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
 
             if sync_gc and (itr + 1) % GARBAGE_COLLECT_ITR_FREQ == 0:
@@ -414,25 +413,35 @@ def main(args, resume_preempt=False):
                             h = F.layer_norm(h, (h.size(-1),))
                         return h
 
-                def forward_predictions(z):
+                def forward_predictions(z, poses_seq):
+                    """
+                    Predict latent sequence conditioned on pose sequence.
 
-                    def _step_predictor(_z, _a, _s, _e):
-                        _z = predictor(_z, _a, _s, _e)
+                    `z` has shape [B, T_tokens, D], where T_tokens is
+                    (num_frames * tokens_per_frame). `poses_seq` is a
+                    per-token pose embedding of shape [B, T_tokens, P].
+                    """
+
+                    def _step_predictor(_z, _p):
+                        _z = predictor(_z, _p)
                         if normalize_reps:
                             _z = F.layer_norm(_z, (_z.size(-1),))
                         return _z
 
-                    # -- one step of predictor with teacher forcing
-                    _z, _a, _s, _e = z[:, :-tokens_per_frame], actions, states[:, :-1], extrinsics[:, :-1]
-                    z_tf = _step_predictor(_z, _a, _s, _e)
+                    # Flatten poses per frame and expand over tokens-per-frame
+                    B, T, _, _ = poses_seq.shape  # poses_seq: [B, T, 4, 4]
+                    poses_flat = poses_seq.view(B, T, -1)  # [B, T, 16]
+                    poses_tokens = (
+                        poses_flat.unsqueeze(2)
+                        .expand(-1, -1, tokens_per_frame, -1)
+                        .reshape(B, T * tokens_per_frame, -1)
+                    )  # [B, T_tokens, 16]
 
-                    # -- full auto-regressive rollouts of predictor
-                    _z = torch.cat([z[:, : tokens_per_frame], z_tf[:, : tokens_per_frame]], dim=1)
-                    for n in range(1, auto_steps):
-                        _a, _s, _e = actions[:, : n + 1], states[:, : n + 1], extrinsics[:, : n + 1]
-                        _z_nxt = _step_predictor(_z, _a, _s, _e)[:, -tokens_per_frame:]
-                        _z = torch.cat([_z, _z_nxt], dim=1)
-                    z_ar = _z[:, tokens_per_frame:]
+                    z_pred = _step_predictor(z, poses_tokens)
+
+                    # For now, we reuse the same prediction for both losses.
+                    z_tf = z_pred
+                    z_ar = z_pred
 
                     return z_tf, z_ar
 
@@ -443,7 +452,7 @@ def main(args, resume_preempt=False):
                 # Step 1. Forward
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
                     h = forward_target(clips)
-                    z_tf, z_ar = forward_predictions(h)
+                    z_tf, z_ar = forward_predictions(h, poses)
                     jloss = loss_fn(z_tf, h)
                     sloss = loss_fn(z_ar, h)
                     loss = jloss + sloss

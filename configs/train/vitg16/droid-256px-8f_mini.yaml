@@ -1,0 +1,52 @@
+app: vjepa_droid
+
+folder: ./outputs/droid_mini_test
+
+# ------------------------------------------------------------
+# DATA
+# ------------------------------------------------------------
+data:
+  datasets:
+    - /your_file_path/droid_train_paths.csv   # <-- CHANGE THIS
+  batch_size: 1
+  dataset_fpcs: [4]        # 4 frames only
+  fps: 4
+  crop_size: 128           # much smaller than 256
+  patch_size: 16
+  tubelet_size: 2
+  camera_views:
+    - left_mp4_path
+
+# ------------------------------------------------------------
+# MODEL
+# ------------------------------------------------------------
+model:
+  model_name: vit_large
+  pred_depth: 12
+  pred_embed_dim: 384
+  pred_num_heads: 12
+  uniform_power: true
+  use_activation_checkpointing: true
+  use_mask_tokens: true
+  use_rope: true
+  zero_init_mask_tokens: true
+
+  
+  load_predictor: false
+  load_encoder: true
+  context_encoder_key: target_encoder
+  target_encoder_key: target_encoder
+  pretrain_checkpoint: /home/x_anadon/vjepa2/checkpoints/vitl.pt
+# ------------------------------------------------------------
+# META
+# ------------------------------------------------------------
+meta:
+  dtype: float16           # Titan V safe
+  seed: 0
+
+# ------------------------------------------------------------
+# OPTIMIZATION
+# ------------------------------------------------------------
+optimization:
+  lr: 1.0e-4
+  weight_decay: 0.04
