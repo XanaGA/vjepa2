@@ -66,7 +66,7 @@ def main(cfg_path):
         tubelet_size=args["data"]["tubelet_size"],
         embed_dim=encoder.embed_dim,
         predictor_embed_dim=cfg_model["pred_embed_dim"],
-        action_embed_dim=16,  # 4x4 pose matrix flattened
+        action_embed_dim=5,  # compact pose: (x, y, z, theta, phi)
         depth=cfg_model["pred_depth"],
         is_frame_causal=True,
         num_heads=cfg_model["pred_num_heads"],
@@ -160,8 +160,8 @@ def main(cfg_path):
             loader = iter(loader)
             sample = next(loader)
 
-        clips = sample[0].to(device)  # [B, C, T, H, W]
-        poses = sample[1].to(device, dtype=torch.float32)  # [B, T, 4, 4]
+        clips = sample["buffer"].to(device)                        # [B, C, T, H, W]
+        poses5 = sample["pose5"].to(device, dtype=torch.float32)    # [B, T, 5]
 
         with torch.cuda.amp.autocast(enabled=use_amp, dtype=dtype):
 
@@ -171,27 +171,21 @@ def main(cfg_path):
                 c = c.flatten(0, 1).unsqueeze(2).repeat(1, 1, 2, 1, 1)
                 h = target_encoder(c)
 
-            # ---- Build action/state sequences from poses
-            # poses: [B, T, 4, 4] -> [B, T, 16]
-            B, T, _, _ = poses.shape
+            # ---- Build action/state sequences from compact poses
+            B, T, _ = poses5.shape
             if T <= 1:
                 raise RuntimeError("Need at least 2 frames per clip for pose prediction.")
 
-            poses_flat = poses.view(B, T, -1)  # [B, T, 16]
+            # actions: pose at time t (last frame), broadcast in predictor
+            # states:  all previous poses (frames 0 … T-2)
+            actions = poses5[:, -1:, :]    # [B, 1, 5]
+            states = poses5[:, :-1, :]     # [B, T-1, 5]
 
-            # x: frames except the last one -> predictor sees context tokens
-            # actions: pose at time t (last pose), broadcast over context length
-            # states: all previous poses (excluding the last one)
-            last_pose = poses_flat[:, -1:, :]           # [B, 1, 16]
-            actions = last_pose                         # broadcasted in pose predictor
-            states = poses_flat[:, :-1, :]              # [B, T-1, 16]
-
-            # ---- Predictor forward (no extrinsics)
+            # ---- Predictor forward
             z = predictor(
                 h[:, :-tokens_per_frame],
                 actions,
                 states,
-                None,
             )
 
             loss = torch.mean(torch.abs(z))

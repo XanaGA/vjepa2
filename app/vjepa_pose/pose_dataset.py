@@ -21,6 +21,86 @@ _GLOBAL_SEED = 0
 logger = getLogger(__name__)
 
 
+# ======================================================================
+# Pose conversions: 4x4 c2w matrix  ⟷  5-number (x, y, z, θ, φ)
+# ======================================================================
+
+def c2w_to_pose5(c2w: torch.Tensor) -> torch.Tensor:
+    """Convert camera-to-world matrices to a compact 5-number pose.
+
+    Parameters
+    ----------
+    c2w : Tensor [*, 4, 4]
+
+    Returns
+    -------
+    pose5 : Tensor [*, 5]
+        ``(x, y, z, theta, phi)`` where ``(x, y, z)`` is the camera
+        position and ``(theta, phi)`` are the spherical-coordinate angles
+        of the camera Z-axis (look direction) in world frame.
+
+        * ``theta`` ∈ [0, π]  — polar angle from world +Z.
+        * ``phi``   ∈ [−π, π] — azimuthal angle in the XY plane.
+    """
+    pos = c2w[..., :3, 3]                                   # [*, 3]
+    look = c2w[..., :3, 2]                                  # [*, 3]
+    theta = torch.acos(look[..., 2].clamp(-1.0, 1.0))       # [*]
+    phi = torch.atan2(look[..., 1], look[..., 0])            # [*]
+    return torch.cat([pos, theta.unsqueeze(-1),
+                      phi.unsqueeze(-1)], dim=-1)            # [*, 5]
+
+
+def pose5_to_c2w(pose5: torch.Tensor) -> torch.Tensor:
+    """Reconstruct camera-to-world matrices from the 5-number pose.
+
+    Roll is fixed to zero (camera Y as close to world +Y as possible).
+
+    Parameters
+    ----------
+    pose5 : Tensor [*, 5]
+
+    Returns
+    -------
+    c2w : Tensor [*, 4, 4]
+    """
+    pos = pose5[..., :3]
+    theta = pose5[..., 3]
+    phi = pose5[..., 4]
+
+    sin_t = torch.sin(theta)
+    z_axis = torch.stack([sin_t * torch.cos(phi),
+                          sin_t * torch.sin(phi),
+                          torch.cos(theta)], dim=-1)         # [*, 3]
+
+    # Gram-Schmidt: x = up × z, y = z × x (zero-roll convention)
+    up = torch.zeros_like(z_axis)
+    up[..., 1] = 1.0                                        # world +Y
+
+    x_axis = torch.linalg.cross(up, z_axis)
+    x_norm = x_axis.norm(dim=-1, keepdim=True)
+
+    # Fallback when look ≈ ±Y (cross product degenerates)
+    fallback = torch.zeros_like(z_axis)
+    fallback[..., 2] = 1.0                                  # world +Z
+    x_fallback = torch.linalg.cross(fallback, z_axis)
+
+    degenerate = (x_norm < 1e-6).expand_as(x_axis)
+    x_axis = torch.where(degenerate, x_fallback, x_axis)
+    x_axis = x_axis / x_axis.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+    y_axis = torch.linalg.cross(z_axis, x_axis)
+
+    batch_shape = pose5.shape[:-1]
+    c2w = torch.zeros(*batch_shape, 4, 4,
+                       dtype=pose5.dtype, device=pose5.device)
+    c2w[..., :3, 0] = x_axis
+    c2w[..., :3, 1] = y_axis
+    c2w[..., :3, 2] = z_axis
+    c2w[..., :3, 3] = pos
+    c2w[..., 3, 3] = 1.0
+    return c2w
+
+
 class PoseVideoDataset(ABC, torch.utils.data.Dataset):
     """Abstract base class for pose-video datasets.
 
@@ -28,10 +108,10 @@ class PoseVideoDataset(ABC, torch.utils.data.Dataset):
 
     Returns
     -------
-    buffer : Tensor [C, T, H, W]
-        Video-like image tensor (after optional *transform*).
-    poses  : Tensor [T, 4, 4]
-        Per-frame 4x4 camera-to-world matrices.
+    dict with keys
+        ``"buffer"``      : Tensor [C, T, H, W]
+        ``"pose_matrix"`` : Tensor [T, 4, 4]  — full camera-to-world matrix
+        ``"pose5"``       : Tensor [T, 5]      — (x, y, z, θ, φ)
     """
 
     def __init__(self, data_path: str, frames_per_clip: int = 16,
@@ -87,8 +167,14 @@ class PoseVideoDataset(ABC, torch.utils.data.Dataset):
             buffer = torch.from_numpy(buffer)        # [T, H, W, C]
             buffer = buffer.permute(3, 0, 1, 2)      # [C, T, H, W]
 
-        poses = torch.stack(poses_list, dim=0)  # [T, 4, 4]
-        return buffer, poses
+        pose_matrix = torch.stack(poses_list, dim=0)  # [T, 4, 4]
+        pose5 = c2w_to_pose5(pose_matrix)              # [T, 5]
+
+        return {
+            "buffer": buffer,
+            "pose_matrix": pose_matrix,
+            "pose5": pose5,
+        }
 
 
 # ======================================================================
