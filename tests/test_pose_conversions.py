@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for c2w_to_pose5 / pose5_to_c2w round-trip conversions."""
+"""Tests for pose conversions and action computation."""
 
 import math
 
@@ -7,6 +7,10 @@ import torch
 import pytest
 
 from app.vjepa_pose.pose_dataset import c2w_to_pose5, pose5_to_c2w
+from app.vjepa_pose.actions import (
+    finite_difference_actions,
+    _wrap_angle,
+)
 
 ATOL = 1e-5
 
@@ -218,3 +222,131 @@ class TestRoundTripReverse:
             self._look_from_pose5(batch),
             atol=ATOL, rtol=0,
         )
+
+
+# ==================================================================
+# Action computation tests
+# ==================================================================
+
+# Build a short pose sequence from three of our hardcoded c2w matrices
+# identity → look +X → look 45° XZ
+_ACTION_SEQUENCE = torch.stack([IDENTITY, LOOK_ALONG_PLUS_X, LOOK_45_XZ], dim=0)
+_ACTION_POSE5_SEQ = c2w_to_pose5(_ACTION_SEQUENCE)  # [3, 5]
+
+
+class TestWrapAngle:
+
+    @pytest.mark.parametrize("raw,expected", [
+        (0.0,              0.0),
+        (math.pi,         -math.pi),      # boundary wraps to -π
+        (-math.pi,        -math.pi),
+        (2 * math.pi,      0.0),
+        (-2 * math.pi,     0.0),
+        (3 * math.pi,     -math.pi),
+        (math.pi / 2,      math.pi / 2),
+        (-math.pi / 2,    -math.pi / 2),
+        (1.5 * math.pi,   -math.pi / 2),  # 270° → -90°
+    ])
+    def test_scalar(self, raw, expected):
+        result = _wrap_angle(torch.tensor(raw))
+        assert result.item() == pytest.approx(expected, abs=ATOL)
+
+    def test_tensor(self):
+        vals = torch.tensor([0.0, 2 * math.pi, -3 * math.pi, math.pi / 4])
+        expected = torch.tensor([0.0, 0.0, -math.pi, math.pi / 4])
+        torch.testing.assert_close(
+            _wrap_angle(vals), expected, atol=ATOL, rtol=0
+        )
+
+
+class TestFiniteDifferenceActions:
+
+    def test_output_shape(self):
+        """T poses → T-1 actions, each of dimension 5."""
+        actions = finite_difference_actions(_ACTION_SEQUENCE)
+        assert actions.shape == (2, 5)
+
+    def test_single_pair(self):
+        """Two poses → exactly one action."""
+        pair = _ACTION_SEQUENCE[:2]
+        actions = finite_difference_actions(pair)
+        assert actions.shape == (1, 5)
+
+    def test_translation_deltas(self):
+        """Translation components must equal pose5 position differences."""
+        actions = finite_difference_actions(_ACTION_SEQUENCE)
+        for t in range(actions.shape[0]):
+            expected_delta = _ACTION_POSE5_SEQ[t + 1, :3] - _ACTION_POSE5_SEQ[t, :3]
+            torch.testing.assert_close(
+                actions[t, :3], expected_delta, atol=ATOL, rtol=0
+            )
+
+    def test_angular_deltas(self):
+        """Angular components must equal wrapped pose5 angle differences."""
+        actions = finite_difference_actions(_ACTION_SEQUENCE)
+        for t in range(actions.shape[0]):
+            dtheta = _ACTION_POSE5_SEQ[t + 1, 3] - _ACTION_POSE5_SEQ[t, 3]
+            dphi = _ACTION_POSE5_SEQ[t + 1, 4] - _ACTION_POSE5_SEQ[t, 4]
+            assert actions[t, 3].item() == pytest.approx(
+                _wrap_angle(dtheta).item(), abs=ATOL
+            )
+            assert actions[t, 4].item() == pytest.approx(
+                _wrap_angle(dphi).item(), abs=ATOL
+            )
+
+    def test_zero_action_for_identical_poses(self):
+        """Same pose repeated → zero action."""
+        repeated = IDENTITY.unsqueeze(0).expand(4, -1, -1)
+        actions = finite_difference_actions(repeated)
+        assert actions.shape == (3, 5)
+        torch.testing.assert_close(
+            actions, torch.zeros(3, 5), atol=ATOL, rtol=0
+        )
+
+    def test_angular_wrapping(self):
+        """Verify wrapping when phi crosses the ±π boundary."""
+        # Pose A: phi just below π,  Pose B: phi just above −π
+        # The true angular motion is small and positive.
+        pose5_a = torch.tensor([0.0, 0.0, 0.0, math.pi / 2, math.pi - 0.1])
+        pose5_b = torch.tensor([0.0, 0.0, 0.0, math.pi / 2, -math.pi + 0.2])
+        c2w_pair = torch.stack([pose5_to_c2w(pose5_a),
+                                pose5_to_c2w(pose5_b)], dim=0)
+
+        actions = finite_difference_actions(c2w_pair)
+        dphi = actions[0, 4].item()
+        # Unwrapped diff would be ≈ −2π + 0.3, wrapped should be ≈ +0.3
+        assert dphi == pytest.approx(0.3, abs=1e-4)
+
+    def test_reconstructing_next_pose(self):
+        """pose5[t] + action[t] should approximate pose5[t+1]."""
+        actions = finite_difference_actions(_ACTION_SEQUENCE)
+        for t in range(actions.shape[0]):
+            reconstructed = _ACTION_POSE5_SEQ[t] + actions[t]
+            # Position must match exactly
+            torch.testing.assert_close(
+                reconstructed[:3], _ACTION_POSE5_SEQ[t + 1, :3],
+                atol=ATOL, rtol=0,
+            )
+            # Angles match after wrapping (compare look directions)
+            theta_r, phi_r = reconstructed[3], reconstructed[4]
+            theta_e, phi_e = _ACTION_POSE5_SEQ[t + 1, 3], _ACTION_POSE5_SEQ[t + 1, 4]
+            sin_r = torch.sin(theta_r)
+            look_r = torch.stack([sin_r * torch.cos(phi_r),
+                                  sin_r * torch.sin(phi_r),
+                                  torch.cos(theta_r)])
+            sin_e = torch.sin(theta_e)
+            look_e = torch.stack([sin_e * torch.cos(phi_e),
+                                  sin_e * torch.sin(phi_e),
+                                  torch.cos(theta_e)])
+            torch.testing.assert_close(look_r, look_e, atol=ATOL, rtol=0)
+
+    def test_custom_action_fn_interface(self):
+        """A custom action_fn with a different D should work."""
+        def translation_only(pose_matrix):
+            p5 = c2w_to_pose5(pose_matrix)
+            return p5[1:, :3] - p5[:-1, :3]   # [T-1, 3]
+
+        actions = translation_only(_ACTION_SEQUENCE)
+        assert actions.shape == (2, 3)
+        expected = finite_difference_actions(_ACTION_SEQUENCE)[:, :3]
+        torch.testing.assert_close(actions, expected, atol=ATOL, rtol=0)

@@ -10,7 +10,7 @@
 import os
 from abc import ABC, abstractmethod
 from logging import getLogger
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -106,20 +106,34 @@ class PoseVideoDataset(ABC, torch.utils.data.Dataset):
 
     Each sample is a temporal clip of ``frames_per_clip`` consecutive frames.
 
+    Parameters
+    ----------
+    action_fn : callable, optional
+        ``(pose_matrix [T, 4, 4]) -> actions [T-1, D]``.
+        Defaults to :func:`~app.vjepa_pose.actions.finite_difference_actions`.
+
     Returns
     -------
     dict with keys
         ``"buffer"``      : Tensor [C, T, H, W]
         ``"pose_matrix"`` : Tensor [T, 4, 4]  — full camera-to-world matrix
         ``"pose5"``       : Tensor [T, 5]      — (x, y, z, θ, φ)
+        ``"actions"``     : Tensor [T-1, D]    — inter-frame actions
     """
 
     def __init__(self, data_path: str, frames_per_clip: int = 16,
-                 transform=None, **kwargs):
+                 transform=None,
+                 action_fn=None,
+                 **kwargs):
         super().__init__()
         self.data_path = os.path.expanduser(data_path)
         self.frames_per_clip = int(frames_per_clip)
         self.transform = transform
+
+        if action_fn is None:
+            from app.vjepa_pose.actions import finite_difference_actions
+            action_fn = finite_difference_actions
+        self.action_fn = action_fn
 
     # ------------------------------------------------------------------
     # Subclass contract
@@ -169,11 +183,13 @@ class PoseVideoDataset(ABC, torch.utils.data.Dataset):
 
         pose_matrix = torch.stack(poses_list, dim=0)  # [T, 4, 4]
         pose5 = c2w_to_pose5(pose_matrix)              # [T, 5]
+        actions = self.action_fn(pose_matrix)           # [T-1, D]
 
         return {
             "buffer": buffer,
             "pose_matrix": pose_matrix,
             "pose5": pose5,
+            "actions": actions,
         }
 
 
